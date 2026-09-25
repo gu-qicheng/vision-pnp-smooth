@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import sys
 from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
 from typing import Optional
 
@@ -44,6 +43,10 @@ MIN_SOLID_RED_SATURATION = 90.0
 CORNER_SMOOTH_ALPHA = 0.35
 MIN_REFERENCE_SIDE_PX = 40.0
 MAX_CORNER_JUMP_RATIO = 0.45
+MAX_TRACKING_MISSES = 3
+LK_WINDOW_SIZE = (31, 31)
+LK_MAX_LEVEL = 3
+MAX_LK_BACKTRACK_ERROR_PX = 2.0
 
 class CalibrationError(ValueError):
     """Raised when a calibration archive is missing or malformed."""
@@ -74,13 +77,8 @@ class AutoFrameResult:
     mask: np.ndarray
     pose: PoseEstimate
     camera_position_mm: Optional[np.ndarray]
-
-
-class CaptureState(Enum):
-    LIVE = "live"
-    SELECTING = "selecting"
-    POSE_VALID = "pose_valid"
-    POSE_INVALID = "pose_invalid"
+    tracked: bool = False
+    tracking_misses: int = 0
 
 
 def _invalid_pose(message: str, candidate_count: int = 0) -> PoseEstimate:
@@ -203,24 +201,6 @@ def build_object_points(side_mm: float = TARGET_SIDE_MM) -> np.ndarray:
     )
 
 
-def preview_to_image(
-    point_xy: tuple[int, int],
-    preview_size: tuple[int, int] = PREVIEW_SIZE,
-    image_size: tuple[int, int] = EXPECTED_IMAGE_SIZE,
-) -> tuple[float, float]:
-    """Map a point in the preview to the corresponding raw-image coordinate."""
-    preview_width, preview_height = preview_size
-    image_width, image_height = image_size
-    if preview_width <= 0 or preview_height <= 0:
-        raise ValueError("预览尺寸必须为正")
-    if image_width <= 0 or image_height <= 0:
-        raise ValueError("图像尺寸必须为正")
-    x, y = point_xy
-    return (
-        float(x) * float(image_width) / float(preview_width),
-        float(y) * float(image_height) / float(preview_height),
-    )
-
 def _align_quad_to_reference(
     corners: np.ndarray,
     reference: np.ndarray,
@@ -246,6 +226,65 @@ def _reference_jump_limit(reference: np.ndarray) -> float:
     side_lengths = np.linalg.norm(np.roll(points, -1, axis=0) - points, axis=1)
     reference_side = float(np.median(side_lengths))
     return max(MIN_REFERENCE_SIDE_PX, reference_side * MAX_CORNER_JUMP_RATIO)
+
+
+def _track_corners(
+    previous_gray: np.ndarray,
+    current_gray: np.ndarray,
+    previous_corners: np.ndarray,
+) -> Optional[np.ndarray]:
+    """Track four corners through one frame with forward-backward LK flow."""
+
+    previous = np.asarray(previous_corners, dtype=np.float32).reshape(4, 1, 2)
+    try:
+        next_points, status, _ = cv2.calcOpticalFlowPyrLK(
+            previous_gray,
+            current_gray,
+            previous,
+            None,
+            winSize=LK_WINDOW_SIZE,
+            maxLevel=LK_MAX_LEVEL,
+        )
+        if next_points is None or status is None or not np.all(status.reshape(-1)):
+            return None
+        if not np.all(np.isfinite(next_points)):
+            return None
+
+        back_points, back_status, _ = cv2.calcOpticalFlowPyrLK(
+            current_gray,
+            previous_gray,
+            next_points,
+            None,
+            winSize=LK_WINDOW_SIZE,
+            maxLevel=LK_MAX_LEVEL,
+        )
+    except cv2.error:
+        return None
+
+    if back_points is None or back_status is None or not np.all(back_status.reshape(-1)):
+        return None
+    back_error = np.linalg.norm(
+        back_points.reshape(4, 2) - previous.reshape(4, 2),
+        axis=1,
+    )
+    if not np.all(np.isfinite(back_error)) or np.max(back_error) > MAX_LK_BACKTRACK_ERROR_PX:
+        return None
+
+    current = next_points.reshape(4, 2).astype(np.float32)
+    height, width = current_gray.shape[:2]
+    if np.any(current < 0) or np.any(current[:, 0] >= width) or np.any(current[:, 1] >= height):
+        return None
+    contour = current.reshape(4, 1, 2)
+    if not cv2.isContourConvex(contour):
+        return None
+    frame_area = float(height * width)
+    if cv2.contourArea(contour) < max(MIN_FRAME_AREA_PX, frame_area * MIN_QUAD_AREA_FRACTION):
+        return None
+
+    aligned, distance = _align_quad_to_reference(current, previous.reshape(4, 2))
+    if distance > _reference_jump_limit(previous.reshape(4, 2)):
+        return None
+    return aligned
 
 
 def _quad_candidate(
@@ -543,44 +582,85 @@ def camera_position_in_target(pose: PoseEstimate) -> Optional[np.ndarray]:
     return position
 
 
-def process_auto_frame(
-    frame: np.ndarray,
-    calibration: CalibrationData,
-    previous_corners: Optional[np.ndarray] = None,
-) -> AutoFrameResult:
-    """Run red-frame detection and PnP once for one camera frame."""
+@dataclass
+class AutoTracker:
+    """Keep the red-frame pose alive across short detector gaps."""
 
-    corners, mask = detect_red_frame(frame, previous_corners=previous_corners)
-    if corners is None:
-        return AutoFrameResult(
-            corners=None,
-            mask=mask,
-            pose=_invalid_pose("未检测到红色方框"),
-            camera_position_mm=None,
-        )
+    calibration: CalibrationData
+    corners: Optional[np.ndarray] = None
+    previous_gray: Optional[np.ndarray] = None
+    tracking_misses: int = 0
 
-    if previous_corners is not None:
-        reference = np.asarray(previous_corners, dtype=np.float32).reshape(4, 2)
-        corners, distance = _align_quad_to_reference(corners, reference)
-        if distance > _reference_jump_limit(reference):
+    def reset(self) -> None:
+        self.corners = None
+        self.previous_gray = None
+        self.tracking_misses = 0
+
+    def update(self, frame: np.ndarray) -> AutoFrameResult:
+        detected, mask = detect_red_frame(frame, previous_corners=self.corners)
+        current_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        corners = detected
+        tracked = False
+        misses = 0
+
+        if (
+            corners is None
+            and self.corners is not None
+            and self.previous_gray is not None
+            and self.tracking_misses < MAX_TRACKING_MISSES
+        ):
+            # 光流只跨过短时颜色丢失；超过上限就清除姿态，避免显示旧坐标。
+            corners = _track_corners(
+                self.previous_gray,
+                current_gray,
+                self.corners,
+            )
+            tracked = corners is not None
+            misses = self.tracking_misses + 1 if tracked else 0
+
+        if corners is None:
+            had_track = self.corners is not None
+            self.corners = None
+            self.previous_gray = current_gray
+            self.tracking_misses = 0
+            message = "红框丢失，跟踪已重置" if had_track else "未检测到红色方框"
             return AutoFrameResult(
                 corners=None,
                 mask=mask,
-                pose=_invalid_pose("检测结果发生跳变，等待重新锁定"),
+                pose=_invalid_pose(message),
                 camera_position_mm=None,
             )
-        corners = (
-            (1.0 - CORNER_SMOOTH_ALPHA) * reference
-            + CORNER_SMOOTH_ALPHA * corners
-        ).astype(np.float32)
 
-    pose = solve_square_pose(corners, calibration)
-    return AutoFrameResult(
-        corners=corners.copy(),
-        mask=mask,
-        pose=pose,
-        camera_position_mm=camera_position_in_target(pose),
-    )
+        if self.corners is not None:
+            reference = self.corners
+            corners, distance = _align_quad_to_reference(corners, reference)
+            if distance > _reference_jump_limit(reference):
+                self.corners = None
+                self.previous_gray = current_gray
+                self.tracking_misses = 0
+                return AutoFrameResult(
+                    corners=None,
+                    mask=mask,
+                    pose=_invalid_pose("检测结果发生跳变，等待重新锁定"),
+                    camera_position_mm=None,
+                )
+            corners = (
+                (1.0 - CORNER_SMOOTH_ALPHA) * reference
+                + CORNER_SMOOTH_ALPHA * corners
+            ).astype(np.float32)
+
+        pose = solve_square_pose(corners, self.calibration)
+        self.corners = corners.copy()
+        self.previous_gray = current_gray
+        self.tracking_misses = misses
+        return AutoFrameResult(
+            corners=corners.copy(),
+            mask=mask,
+            pose=pose,
+            camera_position_mm=camera_position_in_target(pose),
+            tracked=tracked,
+            tracking_misses=misses,
+        )
 
 
 def draw_auto_geometry(
@@ -633,6 +713,10 @@ def auto_status_lines(result: AutoFrameResult) -> list[str]:
     """Build status text for one automatic frame result."""
 
     lines = ["Automatic red-frame detection | Esc: exit", result.pose.message]
+    if result.tracked:
+        lines.append(
+            f"Tracking gap={result.tracking_misses}/{MAX_TRACKING_MISSES}"
+        )
     if result.pose.reprojection_rms_px is not None:
         lines.append(f"RMS={result.pose.reprojection_rms_px:.2f}px")
     lines.append(f"Candidates={result.pose.candidate_count}")
@@ -645,134 +729,6 @@ def auto_status_lines(result: AutoFrameResult) -> list[str]:
         x, y, z = result.camera_position_mm
         lines.append(f"camera_in_target_mm: X={x:.1f} Y={y:.1f} Z={z:.1f}")
     return lines
-
-
-@dataclass
-class DemoSession:
-    calibration: CalibrationData
-    state: CaptureState = CaptureState.LIVE
-    image_points: list[tuple[float, float]] | None = None
-    pose: PoseEstimate | None = None
-    frozen_frame: np.ndarray | None = None
-    latest_frame: np.ndarray | None = None
-
-    def __post_init__(self) -> None:
-        if self.image_points is None:
-            self.image_points = []
-
-    def reset(self) -> None:
-        self.state = CaptureState.LIVE
-        self.image_points = []
-        self.pose = None
-        self.frozen_frame = None
-
-    def click_preview_point(self, preview_point: tuple[int, int]) -> None:
-        if self.latest_frame is None or self.state in {
-            CaptureState.POSE_VALID,
-            CaptureState.POSE_INVALID,
-        }:
-            return
-        if len(self.image_points) == 0:
-            self.frozen_frame = self.latest_frame.copy()
-        if len(self.image_points) >= 4:
-            return
-        self.image_points.append(preview_to_image(preview_point))
-        if len(self.image_points) < 4:
-            self.state = CaptureState.SELECTING
-            return
-        self.pose = solve_square_pose(np.asarray(self.image_points), self.calibration)
-        if self.pose.valid:
-            self.state = CaptureState.POSE_VALID
-            self.frozen_frame = None
-        else:
-            self.state = CaptureState.POSE_INVALID
-
-    def status_lines(self) -> list[str]:
-        lines = [
-            "L-click: TL -> TR -> BR -> BL | R: reset | Esc: exit",
-            f"State: {self.state.value}",
-        ]
-        if self.state == CaptureState.LIVE:
-            lines.append("Click TL to freeze the current frame")
-        elif self.state == CaptureState.SELECTING:
-            lines.append(f"Selected {len(self.image_points)}/4 corners")
-        elif self.state == CaptureState.POSE_INVALID:
-            lines.append("POSE INVALID")
-
-        if self.pose is not None:
-            rms_text = (
-                f"RMS={self.pose.reprojection_rms_px:.2f}px"
-                if self.pose.reprojection_rms_px is not None
-                else "RMS=n/a"
-            )
-            lines.append(self.pose.message)
-            lines.append(rms_text)
-            lines.append(f"Candidates={self.pose.candidate_count}")
-            if self.pose.valid and self.pose.tvec is not None:
-                x, y, z = self.pose.tvec.reshape(3)
-                lines.append(
-                    f"target_center_in_camera_mm: X={x:.1f} Y={y:.1f} Z={z:.1f}"
-                )
-        return lines
-
-    def render(self, live_frame: np.ndarray) -> np.ndarray:
-        if self.state in {CaptureState.SELECTING, CaptureState.POSE_INVALID}:
-            source = self.frozen_frame if self.frozen_frame is not None else live_frame
-        else:
-            source = live_frame
-        canvas = source.copy()
-
-        if self.image_points:
-            raw_points = np.asarray(self.image_points, dtype=np.float64)
-            integer_points = np.rint(raw_points).astype(np.int32)
-            for index, (x, y) in enumerate(integer_points):
-                cv2.circle(canvas, (int(x), int(y)), 8, (0, 255, 255), -1)
-                cv2.putText(
-                    canvas,
-                    POINT_LABELS[index],
-                    (int(x) + 12, int(y) - 12),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.9,
-                    (0, 255, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
-            if len(integer_points) >= 2:
-                cv2.polylines(
-                    canvas,
-                    [integer_points.reshape(-1, 1, 2)],
-                    isClosed=len(integer_points) == 4,
-                    color=(0, 255, 255),
-                    thickness=2,
-                    lineType=cv2.LINE_AA,
-                )
-
-        if self.state == CaptureState.POSE_VALID and self.pose is not None:
-            cv2.drawFrameAxes(
-                canvas,
-                self.calibration.camera_matrix,
-                self.calibration.dist_coeffs,
-                self.pose.rvec,
-                self.pose.tvec,
-                AXIS_LENGTH_MM,
-                3,
-            )
-
-        preview = cv2.resize(canvas, PREVIEW_SIZE, interpolation=cv2.INTER_AREA)
-        status_lines = self.status_lines()
-
-        for index, line in enumerate(status_lines):
-            cv2.putText(
-                preview,
-                line,
-                (20, 32 + index * 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                (0, 255, 0) if self.state != CaptureState.POSE_INVALID else (0, 0, 255),
-                2,
-                cv2.LINE_AA,
-            )
-        return preview
 
 
 def _open_camera(camera_index: int) -> cv2.VideoCapture:
@@ -788,15 +744,10 @@ def _open_camera(camera_index: int) -> cv2.VideoCapture:
     return capture
 
 
-def _mouse_callback(event: int, x: int, y: int, _flags: int, session: DemoSession) -> None:
-    if event == cv2.EVENT_LBUTTONDOWN:
-        session.click_preview_point((x, y))
-
-
 def run_demo(calibration_path: Path, camera_index: int = 0) -> None:
     calibration = load_calibration(calibration_path)
     capture = _open_camera(camera_index)
-    previous_corners: Optional[np.ndarray] = None
+    tracker = AutoTracker(calibration)
     try:
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
         cv2.namedWindow("Red Mask", cv2.WINDOW_AUTOSIZE)
@@ -807,14 +758,7 @@ def run_demo(calibration_path: Path, camera_index: int = 0) -> None:
             if (int(frame.shape[1]), int(frame.shape[0])) != EXPECTED_IMAGE_SIZE:
                 raise RuntimeError("摄像头分辨率在运行中发生变化")
 
-            result = process_auto_frame(
-                frame,
-                calibration,
-                previous_corners=previous_corners,
-            )
-            previous_corners = (
-                result.corners.copy() if result.corners is not None else None
-            )
+            result = tracker.update(frame)
             debug_frame = draw_auto_geometry(frame, result, calibration)
             preview = cv2.resize(debug_frame, PREVIEW_SIZE, interpolation=cv2.INTER_AREA)
             status_color = (0, 255, 0) if result.pose.valid else (0, 0, 255)

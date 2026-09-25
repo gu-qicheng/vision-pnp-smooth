@@ -7,14 +7,12 @@ import numpy as np
 
 import pnp_square_demo as demo
 from pnp_square_demo import (
+    AutoTracker,
     CalibrationData,
     CalibrationError,
     build_object_points,
     load_calibration,
-    preview_to_image,
     solve_square_pose,
-    CaptureState,
-    DemoSession,
     PoseEstimate,
 )
 
@@ -37,20 +35,15 @@ class GeometryTests(unittest.TestCase):
             image_size=(1920, 1080),
         )
 
-    def test_object_points_are_centered_and_105mm(self):
+    def test_object_points_are_centered_and_110mm(self):
         points = build_object_points()
         expected = np.array(
-            [[-52.5, -52.5, 0.0], [52.5, -52.5, 0.0],
-             [52.5, 52.5, 0.0], [-52.5, 52.5, 0.0]],
+            [[-55.0, -55.0, 0.0], [55.0, -55.0, 0.0],
+             [55.0, 55.0, 0.0], [-55.0, 55.0, 0.0]],
             dtype=np.float64,
         )
         np.testing.assert_array_equal(points, expected)
-        self.assertAlmostEqual(np.linalg.norm(points[1] - points[0]), 105.0)
-
-    def test_preview_mapping_1280_to_1920(self):
-        self.assertEqual(preview_to_image((0, 0)), (0.0, 0.0))
-        self.assertEqual(preview_to_image((640, 360)), (960.0, 540.0))
-        self.assertEqual(preview_to_image((1279, 719)), (1918.5, 1078.5))
+        self.assertAlmostEqual(np.linalg.norm(points[1] - points[0]), 110.0)
 
     def test_synthetic_pose_round_trip(self):
         object_points = build_object_points()
@@ -101,33 +94,6 @@ class GeometryTests(unittest.TestCase):
         self.assertIsNone(estimate.tvec)
         self.assertIn('finite', estimate.message.lower())
 
-    def test_first_click_freezes_frame_and_reset_clears_state(self):
-        session = DemoSession(self.calibration)
-        frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
-        session.latest_frame = frame
-        session.click_preview_point((100, 100))
-        self.assertEqual(session.state, CaptureState.SELECTING)
-        self.assertIsNotNone(session.frozen_frame)
-        np.testing.assert_array_equal(session.frozen_frame, frame)
-        session.reset()
-        self.assertEqual(session.state, CaptureState.LIVE)
-        self.assertEqual(session.image_points, [])
-        self.assertIsNone(session.frozen_frame)
-        self.assertIsNone(session.pose)
-
-    def test_invalid_pose_status_is_explicit(self):
-        session = DemoSession(self.calibration)
-        session.state = CaptureState.POSE_INVALID
-        session.pose = PoseEstimate(
-            valid=False,
-            rvec=None,
-            tvec=None,
-            reprojection_rms_px=8.0,
-            candidate_count=2,
-            message='重投影误差过大',
-        )
-        self.assertIn('POSE INVALID', session.status_lines())
-
     def test_order_quad_points_keeps_four_distinct_points_when_rotated(self):
         # A 45-degree diamond used to make the sum/difference heuristic select
         # the same point for two labels.
@@ -153,31 +119,53 @@ class GeometryTests(unittest.TestCase):
             ),
         )
 
-    def test_process_auto_frame_handles_missing_red_frame(self):
-        processor = getattr(demo, 'process_auto_frame', None)
-        self.assertIsNotNone(processor)
+    def test_auto_tracker_handles_missing_red_frame(self):
+        tracker = AutoTracker(self.calibration)
         frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
-        result = processor(frame, self.calibration)
+        result = tracker.update(frame)
         self.assertIsNone(result.corners)
         self.assertFalse(result.pose.valid)
         self.assertIsNone(result.camera_position_mm)
 
-    def test_process_auto_frame_detects_red_quad_and_does_not_reuse_pose(self):
-        processor = getattr(demo, 'process_auto_frame', None)
-        self.assertIsNotNone(processor)
+    def test_auto_tracker_detects_red_quad(self):
+        tracker = AutoTracker(self.calibration)
         red_frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
         cv2.rectangle(red_frame, (650, 300), (1250, 900), (0, 0, 255), 20)
-        valid_result = processor(red_frame, self.calibration)
+        valid_result = tracker.update(red_frame)
         self.assertIsNotNone(valid_result.corners)
         self.assertTrue(valid_result.pose.valid, valid_result.pose.message)
+        self.assertFalse(valid_result.tracked)
 
-        blank_result = processor(
-            np.zeros((1080, 1920, 3), dtype=np.uint8),
-            self.calibration,
-        )
-        self.assertIsNone(blank_result.corners)
-        self.assertFalse(blank_result.pose.valid)
-        self.assertIsNone(blank_result.camera_position_mm)
+    def test_auto_tracker_tracks_three_color_misses_then_resets(self):
+        tracker = AutoTracker(self.calibration)
+        red_frame = self._make_projected_frame(0.0, (0, 0, 255))
+        first = tracker.update(red_frame)
+        self.assertTrue(first.pose.valid, first.pose.message)
+
+        for miss in range(1, 4):
+            tracked = tracker.update(
+                self._make_projected_frame(miss * 8.0, (170, 170, 170))
+            )
+            self.assertIsNotNone(tracked.corners)
+            self.assertTrue(tracked.tracked)
+            self.assertEqual(tracked.tracking_misses, miss)
+
+        lost = tracker.update(np.zeros((1080, 1920, 3), dtype=np.uint8))
+        self.assertIsNone(lost.corners)
+        self.assertFalse(lost.pose.valid)
+        self.assertEqual(lost.tracking_misses, 0)
+        self.assertIsNone(lost.camera_position_mm)
+
+    def test_auto_tracker_follows_moving_projected_110mm_frame(self):
+        tracker = AutoTracker(self.calibration)
+        centers = []
+        for x in (0.0, 8.0, 16.0):
+            result = tracker.update(self._make_projected_frame(x))
+            self.assertTrue(result.pose.valid, result.pose.message)
+            self.assertFalse(result.tracked)
+            centers.append(result.corners.mean(axis=0))
+        self.assertGreater(centers[1][0], centers[0][0])
+        self.assertGreater(centers[2][0], centers[1][0])
 
     def test_camera_position_is_inverse_target_pose(self):
         converter = getattr(demo, 'camera_position_in_target', None)
@@ -238,6 +226,26 @@ class GeometryTests(unittest.TestCase):
             (1120 + dx, 850 + dy),
             (145, 150, 180),
             3,
+        )
+        return frame
+
+    def _make_projected_frame(self, x_mm, color=(0, 0, 255)):
+        rvec = np.array([[0.08], [-0.12], [0.03]], dtype=np.float64)
+        tvec = np.array([[x_mm], [-15.0], [800.0]], dtype=np.float64)
+        points, _ = cv2.projectPoints(
+            build_object_points(),
+            rvec,
+            tvec,
+            self.camera_matrix,
+            self.dist_coeffs,
+        )
+        frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        cv2.polylines(
+            frame,
+            [np.rint(points.reshape(-1, 2)).astype(np.int32)],
+            True,
+            color,
+            8,
         )
         return frame
 
