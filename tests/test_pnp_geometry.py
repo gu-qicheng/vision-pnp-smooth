@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -133,6 +134,7 @@ class GeometryTests(unittest.TestCase):
         cv2.rectangle(red_frame, (650, 300), (1250, 900), (0, 0, 255), 20)
         valid_result = tracker.update(red_frame)
         self.assertIsNotNone(valid_result.corners)
+        self.assertIsNotNone(tracker.raw_corners)
         self.assertTrue(valid_result.pose.valid, valid_result.pose.message)
         self.assertFalse(valid_result.tracked)
 
@@ -155,6 +157,27 @@ class GeometryTests(unittest.TestCase):
         self.assertFalse(lost.pose.valid)
         self.assertEqual(lost.tracking_misses, 0)
         self.assertIsNone(lost.camera_position_mm)
+
+    def test_auto_tracker_clears_invalid_tracked_pose(self):
+        tracker = AutoTracker(self.calibration)
+        first = tracker.update(self._make_projected_frame(0.0))
+        self.assertTrue(first.pose.valid, first.pose.message)
+        invalid_pose = PoseEstimate(
+            valid=False,
+            rvec=None,
+            tvec=None,
+            reprojection_rms_px=6.0,
+            candidate_count=1,
+            message="重投影 RMS 超过阈值",
+        )
+        with patch.object(demo, "solve_square_pose", return_value=invalid_pose):
+            result = tracker.update(
+                self._make_projected_frame(8.0, (170, 170, 170))
+            )
+        self.assertIsNone(result.corners)
+        self.assertFalse(result.pose.valid)
+        self.assertIsNone(tracker.raw_corners)
+        self.assertIsNone(tracker.corners)
 
     def test_auto_tracker_follows_moving_projected_110mm_frame(self):
         tracker = AutoTracker(self.calibration)

@@ -587,11 +587,13 @@ class AutoTracker:
     """Keep the red-frame pose alive across short detector gaps."""
 
     calibration: CalibrationData
+    raw_corners: Optional[np.ndarray] = None
     corners: Optional[np.ndarray] = None
     previous_gray: Optional[np.ndarray] = None
     tracking_misses: int = 0
 
     def reset(self) -> None:
+        self.raw_corners = None
         self.corners = None
         self.previous_gray = None
         self.tracking_misses = 0
@@ -620,9 +622,8 @@ class AutoTracker:
 
         if corners is None:
             had_track = self.corners is not None
-            self.corners = None
+            self.reset()
             self.previous_gray = current_gray
-            self.tracking_misses = 0
             message = "红框丢失，跟踪已重置" if had_track else "未检测到红色方框"
             return AutoFrameResult(
                 corners=None,
@@ -635,9 +636,8 @@ class AutoTracker:
             reference = self.corners
             corners, distance = _align_quad_to_reference(corners, reference)
             if distance > _reference_jump_limit(reference):
-                self.corners = None
+                self.reset()
                 self.previous_gray = current_gray
-                self.tracking_misses = 0
                 return AutoFrameResult(
                     corners=None,
                     mask=mask,
@@ -649,7 +649,18 @@ class AutoTracker:
                 + CORNER_SMOOTH_ALPHA * corners
             ).astype(np.float32)
 
+        raw_corners = corners.copy()
         pose = solve_square_pose(corners, self.calibration)
+        if tracked and not pose.valid:
+            self.reset()
+            self.previous_gray = current_gray
+            return AutoFrameResult(
+                corners=None,
+                mask=mask,
+                pose=pose,
+                camera_position_mm=None,
+            )
+        self.raw_corners = raw_corners
         self.corners = corners.copy()
         self.previous_gray = current_gray
         self.tracking_misses = misses
