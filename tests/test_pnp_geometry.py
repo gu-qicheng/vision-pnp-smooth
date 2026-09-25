@@ -190,6 +190,50 @@ class GeometryTests(unittest.TestCase):
         self.assertGreater(centers[1][0], centers[0][0])
         self.assertGreater(centers[2][0], centers[1][0])
 
+    def test_auto_tracker_uses_velocity_prediction_for_fast_color_gap(self):
+        tracker = AutoTracker(self.calibration)
+        tracker.update(self._make_projected_frame(0.0))
+        second = tracker.update(self._make_projected_frame(20.0))
+        self.assertTrue(second.pose.valid, second.pose.message)
+
+        tracked = tracker.update(
+            self._make_projected_frame(80.0, (170, 170, 170))
+        )
+        self.assertTrue(tracked.tracked)
+        self.assertTrue(tracked.pose.valid, tracked.pose.message)
+        self.assertGreater(
+            float(tracked.corners.mean(axis=0)[0]),
+            float(second.corners.mean(axis=0)[0]) + 50.0,
+        )
+
+    def test_auto_tracker_uses_scaled_roi_for_far_frame(self):
+        tracker = AutoTracker(self.calibration)
+        near = tracker.update(self._make_projected_frame(0.0, z_mm=800.0))
+        self.assertTrue(near.pose.valid, near.pose.message)
+
+        far = tracker.update(self._make_projected_frame(0.0, z_mm=1800.0))
+        self.assertIsNotNone(far.corners)
+        self.assertTrue(far.pose.valid, far.pose.message)
+        self.assertFalse(far.tracked)
+
+    def test_auto_tracker_raises_smoothing_weight_for_fast_detection(self):
+        tracker = AutoTracker(self.calibration)
+        tracker.update(self._make_projected_frame(0.0))
+        second = tracker.update(self._make_projected_frame(4.0))
+        fast_frame = self._make_projected_frame(40.0)
+        raw_corners, _ = demo.detect_red_frame(fast_frame)
+        self.assertIsNotNone(raw_corners)
+
+        fast = tracker.update(fast_frame)
+        self.assertTrue(fast.pose.valid, fast.pose.message)
+        raw_center = raw_corners.mean(axis=0)
+        fast_center = fast.corners.mean(axis=0)
+        previous_center = second.corners.mean(axis=0)
+        self.assertLess(
+            float(raw_center[0] - fast_center[0]),
+            float((raw_center[0] - previous_center[0]) * 0.35),
+        )
+
     def test_auto_tracker_does_not_follow_far_red_distractor(self):
         tracker = AutoTracker(self.calibration)
         first = np.zeros((1080, 1920, 3), dtype=np.uint8)
@@ -264,9 +308,9 @@ class GeometryTests(unittest.TestCase):
         )
         return frame
 
-    def _make_projected_frame(self, x_mm, color=(0, 0, 255)):
+    def _make_projected_frame(self, x_mm, color=(0, 0, 255), z_mm=800.0):
         rvec = np.array([[0.08], [-0.12], [0.03]], dtype=np.float64)
-        tvec = np.array([[x_mm], [-15.0], [800.0]], dtype=np.float64)
+        tvec = np.array([[x_mm], [-15.0], [z_mm]], dtype=np.float64)
         points, _ = cv2.projectPoints(
             build_object_points(),
             rvec,

@@ -32,21 +32,27 @@ MIN_RED_EXCESS = 18
 RED_CLOSE_KERNEL_SIZE = 5
 MIN_FRAME_AREA_PX = 5000
 MIN_QUAD_AREA_FRACTION = 0.005
-MIN_QUAD_RECTANGULARITY = 0.55
-MAX_QUAD_ASPECT_RATIO = 3.5
-MAX_QUAD_ANGLE_COSINE = 0.65
+MIN_QUAD_RECTANGULARITY = 0.70
+MAX_QUAD_ASPECT_RATIO = 5.0
+MAX_QUAD_ANGLE_COSINE = 0.8
 MAX_BORDER_FILL_RATIO = 0.35
 MIN_BORDER_EDGE_FRACTION = 0.45
 MIN_SOLID_RED_FILL_RATIO = 0.35
 MIN_SOLID_RED_EXCESS = 70.0
 MIN_SOLID_RED_SATURATION = 90.0
-CORNER_SMOOTH_ALPHA = 0.35
-MIN_REFERENCE_SIDE_PX = 40.0
-MAX_CORNER_JUMP_RATIO = 0.45
+CORNER_SMOOTH_ALPHA = 0.5
+FAST_CORNER_SMOOTH_ALPHA = 0.85
+ADAPTIVE_SMOOTH_SPEED_RATIO = 0.25
+MIN_REFERENCE_SIDE_PX = 50.0
+MAX_CORNER_JUMP_RATIO = 0.55
 MAX_TRACKING_MISSES = 3
-LK_WINDOW_SIZE = (31, 31)
-LK_MAX_LEVEL = 3
-MAX_LK_BACKTRACK_ERROR_PX = 2.0
+LK_WINDOW_SIZE = (41, 41)
+LK_MAX_LEVEL = 5
+MAX_LK_BACKTRACK_ERROR_PX = 4.0
+MAX_HOMOGRAPHY_ERROR_PX = 3.0
+LK_EDGE_THRESHOLDS = (20, 80)
+ROI_PADDING_RATIO = 0.75
+ROI_UPSCALE = 2.0
 
 class CalibrationError(ValueError):
     """Raised when a calibration archive is missing or malformed."""
@@ -228,22 +234,159 @@ def _reference_jump_limit(reference: np.ndarray) -> float:
     return max(MIN_REFERENCE_SIDE_PX, reference_side * MAX_CORNER_JUMP_RATIO)
 
 
+def _homography_is_consistent(
+    previous_corners: np.ndarray,
+    current_corners: np.ndarray,
+) -> bool:
+    """Reject a four-corner motion that cannot be explained by one homography."""
+
+    previous = np.asarray(previous_corners, dtype=np.float32).reshape(4, 1, 2)
+    current = np.asarray(current_corners, dtype=np.float32).reshape(4, 1, 2)
+    if not np.all(np.isfinite(previous)) or not np.all(np.isfinite(current)):
+        return False
+    try:
+        homography, inliers = cv2.findHomography(
+            previous,
+            current,
+            cv2.RANSAC,
+            MAX_HOMOGRAPHY_ERROR_PX,
+        )
+        if homography is None or inliers is None:
+            return False
+        projected = cv2.perspectiveTransform(previous, homography)
+    except cv2.error:
+        return False
+    if not np.all(np.isfinite(homography)) or not np.all(inliers):
+        return False
+    error = np.linalg.norm(
+        projected.reshape(4, 2) - current.reshape(4, 2),
+        axis=1,
+    )
+    return bool(np.all(np.isfinite(error)) and np.max(error) <= MAX_HOMOGRAPHY_ERROR_PX)
+
+
+def _refine_corners(gray: np.ndarray, corners: np.ndarray) -> np.ndarray:
+    """Refine detected corners to sub-pixel locations without changing their order."""
+
+    points = np.asarray(corners, dtype=np.float32).reshape(4, 2)
+    criteria = (
+        cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+        20,
+        0.03,
+    )
+    try:
+        refined = cv2.cornerSubPix(
+            gray,
+            points.reshape(4, 1, 2),
+            (5, 5),
+            (-1, -1),
+            criteria,
+        )
+    except cv2.error:
+        return points.copy()
+    if refined is None or not np.all(np.isfinite(refined)):
+        return points.copy()
+    aligned, distance = _align_quad_to_reference(refined.reshape(4, 2), points)
+    if distance > max(4.0, _reference_jump_limit(points) * 0.1):
+        return points.copy()
+    return aligned.astype(np.float32)
+
+
+def _roi_bounds(
+    frame_shape: tuple[int, ...],
+    reference_corners: np.ndarray,
+) -> tuple[int, int, int, int] | None:
+    """Return a clipped search ROI around the predicted quadrilateral."""
+
+    points = np.asarray(reference_corners, dtype=np.float32).reshape(4, 2)
+    if not np.all(np.isfinite(points)):
+        return None
+    height, width = frame_shape[:2]
+    x_min, y_min = np.min(points, axis=0)
+    x_max, y_max = np.max(points, axis=0)
+    span = max(float(x_max - x_min), float(y_max - y_min), 32.0)
+    padding = max(32.0, span * ROI_PADDING_RATIO)
+    left = max(0, int(np.floor(x_min - padding)))
+    top = max(0, int(np.floor(y_min - padding)))
+    right = min(width, int(np.ceil(x_max + padding)))
+    bottom = min(height, int(np.ceil(y_max + padding)))
+    if right - left < 16 or bottom - top < 16:
+        return None
+    return left, top, right, bottom
+
+
+def _detect_red_frame_in_roi(
+    frame: np.ndarray,
+    reference_corners: np.ndarray,
+) -> tuple[Optional[np.ndarray], np.ndarray]:
+    """Detect a frame in an enlarged predicted ROI and map it back to full image coordinates."""
+
+    bounds = _roi_bounds(frame.shape, reference_corners)
+    full_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+    if bounds is None:
+        return None, full_mask
+    left, top, right, bottom = bounds
+    crop = frame[top:bottom, left:right]
+    scaled = cv2.resize(
+        crop,
+        None,
+        fx=ROI_UPSCALE,
+        fy=ROI_UPSCALE,
+        interpolation=cv2.INTER_CUBIC,
+    )
+    local_reference = (
+        (np.asarray(reference_corners, dtype=np.float32).reshape(4, 2)
+         - np.array([left, top], dtype=np.float32))
+        * ROI_UPSCALE
+    )
+    corners, local_mask = detect_red_frame(
+        scaled,
+        previous_corners=local_reference,
+    )
+    if local_mask is not None:
+        full_mask[top:bottom, left:right] = cv2.resize(
+            local_mask,
+            (right - left, bottom - top),
+            interpolation=cv2.INTER_NEAREST,
+        )
+    if corners is None:
+        return None, full_mask
+    mapped = corners / ROI_UPSCALE + np.array([left, top], dtype=np.float32)
+    return mapped.astype(np.float32), full_mask
+
+
+def _flow_image(gray: np.ndarray) -> np.ndarray:
+    """Use edges so LK survives a temporary red-to-gray appearance change."""
+
+    return cv2.Canny(gray, *LK_EDGE_THRESHOLDS)
+
+
 def _track_corners(
     previous_gray: np.ndarray,
     current_gray: np.ndarray,
     previous_corners: np.ndarray,
+    predicted_corners: Optional[np.ndarray] = None,
 ) -> Optional[np.ndarray]:
-    """Track four corners through one frame with forward-backward LK flow."""
+    """Track four corners with predicted LK flow and a homography gate."""
 
     previous = np.asarray(previous_corners, dtype=np.float32).reshape(4, 1, 2)
+    predicted = (
+        np.asarray(predicted_corners, dtype=np.float32).reshape(4, 1, 2)
+        if predicted_corners is not None
+        else None
+    )
+    flow_flags = cv2.OPTFLOW_USE_INITIAL_FLOW if predicted is not None else 0
+    previous_flow = _flow_image(previous_gray)
+    current_flow = _flow_image(current_gray)
     try:
         next_points, status, _ = cv2.calcOpticalFlowPyrLK(
-            previous_gray,
-            current_gray,
+            previous_flow,
+            current_flow,
             previous,
-            None,
+            predicted,
             winSize=LK_WINDOW_SIZE,
             maxLevel=LK_MAX_LEVEL,
+            flags=flow_flags,
         )
         if next_points is None or status is None or not np.all(status.reshape(-1)):
             return None
@@ -251,8 +394,8 @@ def _track_corners(
             return None
 
         back_points, back_status, _ = cv2.calcOpticalFlowPyrLK(
-            current_gray,
-            previous_gray,
+            current_flow,
+            previous_flow,
             next_points,
             None,
             winSize=LK_WINDOW_SIZE,
@@ -281,8 +424,15 @@ def _track_corners(
     if cv2.contourArea(contour) < max(MIN_FRAME_AREA_PX, frame_area * MIN_QUAD_AREA_FRACTION):
         return None
 
-    aligned, distance = _align_quad_to_reference(current, previous.reshape(4, 2))
-    if distance > _reference_jump_limit(previous.reshape(4, 2)):
+    gate_reference = (
+        predicted.reshape(4, 2)
+        if predicted is not None
+        else previous.reshape(4, 2)
+    )
+    aligned, distance = _align_quad_to_reference(current, gate_reference)
+    if distance > _reference_jump_limit(gate_reference):
+        return None
+    if not _homography_is_consistent(previous.reshape(4, 2), aligned):
         return None
     return aligned
 
@@ -590,40 +740,98 @@ class AutoTracker:
     raw_corners: Optional[np.ndarray] = None
     corners: Optional[np.ndarray] = None
     previous_gray: Optional[np.ndarray] = None
+    velocity: Optional[np.ndarray] = None
     tracking_misses: int = 0
 
     def reset(self) -> None:
         self.raw_corners = None
         self.corners = None
         self.previous_gray = None
+        self.velocity = None
         self.tracking_misses = 0
 
+    def _predicted_corners(self) -> Optional[np.ndarray]:
+        if self.corners is None:
+            return None
+        prediction = self.corners.copy()
+        if self.velocity is not None:
+            prediction += self.velocity * float(self.tracking_misses + 1)
+        return prediction.astype(np.float32)
+
+    def _smooth_corners(
+        self,
+        raw_corners: np.ndarray,
+        reference: Optional[np.ndarray],
+    ) -> np.ndarray:
+        if reference is None:
+            return raw_corners.astype(np.float32)
+        raw = np.asarray(raw_corners, dtype=np.float32).reshape(4, 2)
+        previous = np.asarray(reference, dtype=np.float32).reshape(4, 2)
+        speed = float(np.mean(np.linalg.norm(raw - previous, axis=1)))
+        side = max(_reference_jump_limit(previous), 1.0)
+        speed_ratio = min(1.0, speed / (side * ADAPTIVE_SMOOTH_SPEED_RATIO))
+        alpha = CORNER_SMOOTH_ALPHA + (
+            FAST_CORNER_SMOOTH_ALPHA - CORNER_SMOOTH_ALPHA
+        ) * speed_ratio
+        return ((1.0 - alpha) * previous + alpha * raw).astype(np.float32)
+
+    def _accept_velocity(self, corners: np.ndarray) -> None:
+        if self.corners is None:
+            self.velocity = None
+            return
+        delta = np.asarray(corners, dtype=np.float32) - self.corners
+        if self.velocity is None:
+            self.velocity = delta
+        else:
+            self.velocity = 0.5 * self.velocity + 0.5 * delta
+
     def update(self, frame: np.ndarray) -> AutoFrameResult:
-        detected, mask = detect_red_frame(frame, previous_corners=self.corners)
         current_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        corners = detected
+        predicted = self._predicted_corners()
+        corners: Optional[np.ndarray] = None
+        mask = np.zeros(frame.shape[:2], dtype=np.uint8)
         tracked = False
         misses = 0
 
-        if (
-            corners is None
-            and self.corners is not None
-            and self.previous_gray is not None
-            and self.tracking_misses < MAX_TRACKING_MISSES
-        ):
-            # 光流只跨过短时颜色丢失；超过上限就清除姿态，避免显示旧坐标。
-            corners = _track_corners(
-                self.previous_gray,
-                current_gray,
-                self.corners,
-            )
-            tracked = corners is not None
-            misses = self.tracking_misses + 1 if tracked else 0
+        if predicted is None:
+            corners, mask = detect_red_frame(frame)
+        else:
+            # 先在预测 ROI 中放大检测，再用光流跨过短暂颜色丢失。
+            corners, mask = _detect_red_frame_in_roi(frame, predicted)
+            if corners is None and self.previous_gray is not None:
+                if self.tracking_misses < MAX_TRACKING_MISSES:
+                    corners = _track_corners(
+                        self.previous_gray,
+                        current_gray,
+                        self.corners,
+                        predicted_corners=predicted,
+                    )
+                    tracked = corners is not None
+                    misses = self.tracking_misses + 1 if tracked else 0
+
+            if corners is None:
+                # ROI 和光流都失败时，仅接受仍与运动预测一致的全画面候选。
+                detected, full_mask = detect_red_frame(
+                    frame,
+                    previous_corners=predicted,
+                )
+                if detected is not None:
+                    aligned, distance = _align_quad_to_reference(
+                        detected,
+                        predicted,
+                    )
+                    if (
+                        distance <= _reference_jump_limit(predicted)
+                        and _homography_is_consistent(self.corners, aligned)
+                    ):
+                        corners = aligned
+                        mask = full_mask
+                        tracked = False
+                        misses = 0
 
         if corners is None:
             had_track = self.corners is not None
             self.reset()
-            self.previous_gray = current_gray
             message = "红框丢失，跟踪已重置" if had_track else "未检测到红色方框"
             return AutoFrameResult(
                 corners=None,
@@ -632,34 +840,48 @@ class AutoTracker:
                 camera_position_mm=None,
             )
 
+        if not tracked:
+            corners = _refine_corners(current_gray, corners)
         if self.corners is not None:
             reference = self.corners
             corners, distance = _align_quad_to_reference(corners, reference)
-            if distance > _reference_jump_limit(reference):
+            predicted_distance = (
+                float(np.mean(np.linalg.norm(corners - predicted, axis=1)))
+                if predicted is not None
+                else float("inf")
+            )
+            if (
+                distance > _reference_jump_limit(reference)
+                and predicted_distance > _reference_jump_limit(predicted)
+            ):
                 self.reset()
-                self.previous_gray = current_gray
                 return AutoFrameResult(
                     corners=None,
                     mask=mask,
                     pose=_invalid_pose("检测结果发生跳变，等待重新锁定"),
                     camera_position_mm=None,
                 )
-            corners = (
-                (1.0 - CORNER_SMOOTH_ALPHA) * reference
-                + CORNER_SMOOTH_ALPHA * corners
-            ).astype(np.float32)
+            if not _homography_is_consistent(reference, corners):
+                self.reset()
+                return AutoFrameResult(
+                    corners=None,
+                    mask=mask,
+                    pose=_invalid_pose("四角运动不符合单应性，跟踪已重置"),
+                    camera_position_mm=None,
+                )
+            corners = self._smooth_corners(corners, reference)
 
         raw_corners = corners.copy()
         pose = solve_square_pose(corners, self.calibration)
-        if tracked and not pose.valid:
+        if not pose.valid:
             self.reset()
-            self.previous_gray = current_gray
             return AutoFrameResult(
                 corners=None,
                 mask=mask,
                 pose=pose,
                 camera_position_mm=None,
             )
+        self._accept_velocity(corners)
         self.raw_corners = raw_corners
         self.corners = corners.copy()
         self.previous_gray = current_gray
