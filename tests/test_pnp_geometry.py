@@ -167,6 +167,18 @@ class GeometryTests(unittest.TestCase):
         self.assertGreater(centers[1][0], centers[0][0])
         self.assertGreater(centers[2][0], centers[1][0])
 
+    def test_auto_tracker_does_not_follow_far_red_distractor(self):
+        tracker = AutoTracker(self.calibration)
+        first = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        cv2.rectangle(first, (650, 300), (1250, 900), (0, 0, 255), 20)
+        self.assertTrue(tracker.update(first).pose.valid)
+
+        distractor = np.zeros_like(first)
+        cv2.rectangle(distractor, (1350, 100), (1800, 900), (0, 0, 255), 20)
+        result = tracker.update(distractor)
+        self.assertIsNone(result.corners)
+        self.assertFalse(result.pose.valid)
+
     def test_camera_position_is_inverse_target_pose(self):
         converter = getattr(demo, 'camera_position_in_target', None)
         self.assertIsNotNone(converter)
