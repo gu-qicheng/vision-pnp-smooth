@@ -35,21 +35,18 @@ MIN_QUAD_AREA_FRACTION = 0.005
 MIN_QUAD_RECTANGULARITY = 0.70
 MAX_QUAD_ASPECT_RATIO = 5.0
 MAX_QUAD_ANGLE_COSINE = 0.8
-MAX_BORDER_FILL_RATIO = 0.35
 MIN_BORDER_EDGE_FRACTION = 0.45
-MIN_SOLID_RED_FILL_RATIO = 0.35
-MIN_SOLID_RED_EXCESS = 70.0
-MIN_SOLID_RED_SATURATION = 90.0
 CORNER_SMOOTH_ALPHA = 0.5
 FAST_CORNER_SMOOTH_ALPHA = 0.85
 ADAPTIVE_SMOOTH_SPEED_RATIO = 0.25
 MIN_REFERENCE_SIDE_PX = 50.0
-MAX_CORNER_JUMP_RATIO = 0.55
+MAX_CORNER_JUMP_RATIO = 1.5
 MAX_TRACKING_MISSES = 3
 LK_WINDOW_SIZE = (41, 41)
 LK_MAX_LEVEL = 5
 MAX_LK_BACKTRACK_ERROR_PX = 4.0
 MAX_HOMOGRAPHY_ERROR_PX = 3.0
+MAX_HOMOGRAPHY_SIDE_RATIO = 2.5
 LK_EDGE_THRESHOLDS = (20, 80)
 ROI_PADDING_RATIO = 0.75
 ROI_UPSCALE = 2.0
@@ -262,7 +259,24 @@ def _homography_is_consistent(
         projected.reshape(4, 2) - current.reshape(4, 2),
         axis=1,
     )
-    return bool(np.all(np.isfinite(error)) and np.max(error) <= MAX_HOMOGRAPHY_ERROR_PX)
+    if not np.all(np.isfinite(error)) or np.max(error) > MAX_HOMOGRAPHY_ERROR_PX:
+        return False
+    previous_lengths = np.linalg.norm(
+        np.roll(previous.reshape(4, 2), -1, axis=0) - previous.reshape(4, 2), axis=1
+    )
+    current_lengths = np.linalg.norm(
+        np.roll(current.reshape(4, 2), -1, axis=0) - current.reshape(4, 2), axis=1
+    )
+    if np.any(previous_lengths <= 1e-6) or np.any(current_lengths <= 1e-6):
+        return False
+    scale = current_lengths / previous_lengths
+    median_scale = float(np.median(scale))
+    return bool(
+        np.isfinite(median_scale)
+        and median_scale > 0
+        and np.all(scale / median_scale <= MAX_HOMOGRAPHY_SIDE_RATIO)
+        and np.all(median_scale / scale <= MAX_HOMOGRAPHY_SIDE_RATIO)
+    )
 
 
 def _refine_corners(gray: np.ndarray, corners: np.ndarray) -> np.ndarray:
@@ -371,7 +385,7 @@ def _track_corners(
 
     previous = np.asarray(previous_corners, dtype=np.float32).reshape(4, 1, 2)
     predicted = (
-        np.asarray(predicted_corners, dtype=np.float32).reshape(4, 1, 2)
+        np.asarray(predicted_corners, dtype=np.float32).reshape(4, 1, 2).copy()
         if predicted_corners is not None
         else None
     )
@@ -383,7 +397,7 @@ def _track_corners(
             previous_flow,
             current_flow,
             previous,
-            predicted,
+            None if predicted is None else predicted.copy(),
             winSize=LK_WINDOW_SIZE,
             maxLevel=LK_MAX_LEVEL,
             flags=flow_flags,
@@ -397,9 +411,10 @@ def _track_corners(
             current_flow,
             previous_flow,
             next_points,
-            None,
+            previous.copy(),
             winSize=LK_WINDOW_SIZE,
             maxLevel=LK_MAX_LEVEL,
+            flags=cv2.OPTFLOW_USE_INITIAL_FLOW,
         )
     except cv2.error:
         return None
@@ -440,7 +455,6 @@ def _track_corners(
 def _quad_candidate(
     contour: np.ndarray,
     mask: np.ndarray,
-    hsv: np.ndarray,
     red_excess: np.ndarray,
     frame_area: int,
 ) -> tuple[float, np.ndarray] | None:
@@ -498,23 +512,14 @@ def _quad_candidate(
 
     selected = cv2.bitwise_and(mask, polygon) > 0
     mean_excess = float(np.mean(red_excess[selected]))
-    mean_saturation = float(np.mean(hsv[:, :, 1][selected]))
-    border_like = (
-        fill_ratio <= MAX_BORDER_FILL_RATIO
-        and edge_fraction >= MIN_BORDER_EDGE_FRACTION
-    )
-    solid_like = (
-        fill_ratio >= MIN_SOLID_RED_FILL_RATIO
-        and mean_excess >= MIN_SOLID_RED_EXCESS
-        and mean_saturation >= MIN_SOLID_RED_SATURATION
-    )
-    if not border_like and not solid_like:
+    border_like = edge_fraction >= MIN_BORDER_EDGE_FRACTION
+    if not border_like:
         return None
 
     aspect_score = 1.0 - min(1.0, max(0.0, aspect_ratio - 1.0) / 2.5)
     angle_score = 1.0 - max_angle_cosine / MAX_QUAD_ANGLE_COSINE
-    color_score = min(1.0, mean_excess / MIN_SOLID_RED_EXCESS)
-    edge_score = edge_fraction if border_like else fill_ratio
+    color_score = min(1.0, mean_excess / max(MIN_RED_EXCESS, 1))
+    edge_score = edge_fraction
     score = (
         rectangularity
         * max(0.0, aspect_score)
@@ -598,7 +603,6 @@ def detect_red_frame(
         candidate = _quad_candidate(
             contour,
             mask,
-            hsv,
             red_excess,
             frame_area,
         )
@@ -751,11 +755,11 @@ class AutoTracker:
         self.tracking_misses = 0
 
     def _predicted_corners(self) -> Optional[np.ndarray]:
-        if self.corners is None:
+        if self.raw_corners is None:
             return None
-        prediction = self.corners.copy()
+        prediction = self.raw_corners.copy()
         if self.velocity is not None:
-            prediction += self.velocity * float(self.tracking_misses + 1)
+            prediction += self.velocity
         return prediction.astype(np.float32)
 
     def _smooth_corners(
@@ -768,7 +772,9 @@ class AutoTracker:
         raw = np.asarray(raw_corners, dtype=np.float32).reshape(4, 2)
         previous = np.asarray(reference, dtype=np.float32).reshape(4, 2)
         speed = float(np.mean(np.linalg.norm(raw - previous, axis=1)))
-        side = max(_reference_jump_limit(previous), 1.0)
+        side = max(50.0, float(np.median(
+            np.linalg.norm(np.roll(previous, -1, axis=0) - previous, axis=1)
+        )) * 0.55)
         speed_ratio = min(1.0, speed / (side * ADAPTIVE_SMOOTH_SPEED_RATIO))
         alpha = CORNER_SMOOTH_ALPHA + (
             FAST_CORNER_SMOOTH_ALPHA - CORNER_SMOOTH_ALPHA
@@ -776,10 +782,10 @@ class AutoTracker:
         return ((1.0 - alpha) * previous + alpha * raw).astype(np.float32)
 
     def _accept_velocity(self, corners: np.ndarray) -> None:
-        if self.corners is None:
+        if self.raw_corners is None:
             self.velocity = None
             return
-        delta = np.asarray(corners, dtype=np.float32) - self.corners
+        delta = np.asarray(corners, dtype=np.float32) - self.raw_corners
         if self.velocity is None:
             self.velocity = delta
         else:
@@ -803,26 +809,26 @@ class AutoTracker:
                     corners = _track_corners(
                         self.previous_gray,
                         current_gray,
-                        self.corners,
+                        self.raw_corners,
                         predicted_corners=predicted,
                     )
                     tracked = corners is not None
                     misses = self.tracking_misses + 1 if tracked else 0
 
             if corners is None:
-                # ROI 和光流都失败时，仅接受仍与运动预测一致的全画面候选。
+                # 急停/反向时预测会偏离：全图回退以最近实测位置重新匹配。
                 detected, full_mask = detect_red_frame(
                     frame,
-                    previous_corners=predicted,
+                    previous_corners=self.raw_corners,
                 )
                 if detected is not None:
                     aligned, distance = _align_quad_to_reference(
                         detected,
-                        predicted,
+                        self.raw_corners,
                     )
                     if (
-                        distance <= _reference_jump_limit(predicted)
-                        and _homography_is_consistent(self.corners, aligned)
+                        distance <= _reference_jump_limit(self.raw_corners)
+                        and _homography_is_consistent(self.raw_corners, aligned)
                     ):
                         corners = aligned
                         mask = full_mask
@@ -842,8 +848,8 @@ class AutoTracker:
 
         if not tracked:
             corners = _refine_corners(current_gray, corners)
-        if self.corners is not None:
-            reference = self.corners
+        if self.raw_corners is not None:
+            reference = self.raw_corners
             corners, distance = _align_quad_to_reference(corners, reference)
             predicted_distance = (
                 float(np.mean(np.linalg.norm(corners - predicted, axis=1)))
@@ -869,8 +875,6 @@ class AutoTracker:
                     pose=_invalid_pose("四角运动不符合单应性，跟踪已重置"),
                     camera_position_mm=None,
                 )
-            corners = self._smooth_corners(corners, reference)
-
         raw_corners = corners.copy()
         pose = solve_square_pose(corners, self.calibration)
         if not pose.valid:
@@ -881,7 +885,14 @@ class AutoTracker:
                 pose=pose,
                 camera_position_mm=None,
             )
-        self._accept_velocity(corners)
+        corners = self._smooth_corners(raw_corners, self.corners)
+        smooth_pose = solve_square_pose(corners, self.calibration)
+        if smooth_pose.valid:
+            pose = smooth_pose
+        else:
+            # Keep a valid current measurement if image-space EMA distorts the quad.
+            corners = raw_corners.copy()
+        self._accept_velocity(raw_corners)
         self.raw_corners = raw_corners
         self.corners = corners.copy()
         self.previous_gray = current_gray
