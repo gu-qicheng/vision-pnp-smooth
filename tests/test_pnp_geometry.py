@@ -295,6 +295,63 @@ class GeometryTests(unittest.TestCase):
         )
         self.assertIsNone(rejected)
 
+    def test_fast_translation_and_reversal_keep_current_target(self):
+        tracker = AutoTracker(self.calibration)
+        for x in (0.0, 100.0, 200.0, 100.0, 0.0):
+            result = tracker.update(self._make_projected_frame(x))
+            self.assertTrue(result.pose.valid, (x, result.pose.message))
+            # The raw tracker must stay on the current image, not lag with EMA.
+            expected, _ = cv2.projectPoints(
+                build_object_points(), np.array([0.08, -0.12, 0.03]),
+                np.array([x, -15.0, 800.0]), self.camera_matrix, self.dist_coeffs,
+            )
+            np.testing.assert_allclose(
+                tracker.raw_corners.mean(axis=0), expected.reshape(4, 2).mean(axis=0),
+                atol=3.0,
+            )
+
+    def test_prediction_stays_one_frame_ahead_during_color_gaps(self):
+        tracker = AutoTracker(self.calibration)
+        for index, x in enumerate((0.0, 20.0, 40.0, 60.0, 80.0, 100.0, 120.0)):
+            color = (170, 170, 170) if 3 <= index <= 5 else (0, 0, 255)
+            result = tracker.update(self._make_projected_frame(x, color))
+            self.assertTrue(result.pose.valid, (index, result.pose.message))
+            if 3 <= index <= 5:
+                self.assertTrue(result.tracked)
+                expected, _ = cv2.projectPoints(
+                    build_object_points(), np.array([0.08, -0.12, 0.03]),
+                    np.array([x + 20.0, -15.0, 800.0]),
+                    self.camera_matrix, self.dist_coeffs,
+                )
+                np.testing.assert_allclose(
+                    tracker._predicted_corners().mean(axis=0),
+                    expected.reshape(4, 2).mean(axis=0), atol=5.0,
+                )
+
+    def test_solid_skin_and_red_quads_never_initialize_pose(self):
+        points = np.array([[886, 423], [1053, 429], [1046, 594], [882, 591]])
+        for color in ((70, 95, 170), (30, 50, 120), (0, 0, 255)):
+            with self.subTest(color=color):
+                frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+                cv2.fillConvexPoly(frame, points, color)
+                result = AutoTracker(self.calibration).update(frame)
+                self.assertIsNone(result.corners)
+                self.assertFalse(result.pose.valid)
+
+    def test_flow_rejects_four_consistent_but_unsupported_corners(self):
+        previous = np.array([[500, 300], [1100, 300], [1100, 900], [500, 900]],
+                            dtype=np.float32).reshape(4, 1, 2)
+        wrong = np.array([[540, 330], [1140, 330], [1160, 430], [540, 930]],
+                         dtype=np.float32).reshape(4, 1, 2)
+        gray = np.zeros((1080, 1920), dtype=np.uint8)
+        cv2.polylines(gray, [previous.astype(np.int32)], True, 170, 8)
+        status = np.ones((4, 1), dtype=np.uint8)
+        # Simulate a reversible LK mismatch. Real geometry/image checks must reject it.
+        with patch.object(cv2, 'calcOpticalFlowPyrLK', side_effect=[
+            (wrong.copy(), status, None), (previous.copy(), status, None),
+        ]):
+            self.assertIsNone(demo._track_corners(gray, gray, previous, previous.copy()))
+
     @staticmethod
     def _make_thin_red_frame(offset=(0, 0)):
         dx, dy = offset
